@@ -20,11 +20,21 @@ from pathlib import Path
 
 from . import __version__
 from . import repo as gitrepo
+from .attestation import (
+    STATUS_TEXT as ATTESTATION_STATUS_TEXT,
+    AttestationError,
+    generate_key,
+    is_satisfied,
+    load_key,
+    sign_file,
+    verify_file,
+)
 from .budget import create_authorization, evaluate, status_report
 from .config import ENV_REPO, ConfigError, find_repo_root
 from .ingest import available_parsers, get_parser, iter_source_files, parse_kv_map
 from .ledger import DuplicateVoucher, Ledger, LedgerError, build_usage_payload
 from .models import (
+    KIND_ATTESTATION,
     KIND_AUTHORIZATION,
     KIND_USAGE,
     Usage,
@@ -42,6 +52,7 @@ EXIT_ERROR = 1
 EXIT_AUDIT_FAILED = 3
 EXIT_RECONCILE_DIFF = 4
 EXIT_BUDGET_EXCEEDED = 5
+EXIT_ATTESTATION_FAILED = 6
 
 BUDGET_STATUS_TEXT = {
     "within": "未超限",
@@ -169,6 +180,19 @@ def _load_session_names(home: Path) -> dict:
 # --------------------------------------------------------------------------- #
 # 子命令
 # --------------------------------------------------------------------------- #
+def _expand_paths(paths, pattern: str = "*.jsonl") -> list:
+    files = []
+    for item in paths:
+        source = Path(item).expanduser()
+        if source.is_dir():
+            files.extend(iter_source_files(source, pattern=pattern))
+        elif source.is_file():
+            files.append(source)
+        else:
+            print("跳过不存在的路径：{0}".format(source), file=sys.stderr)
+    return files
+
+
 def cmd_init(args) -> int:
     if args.path:
         target = Path(args.path).expanduser()
@@ -299,8 +323,29 @@ def cmd_ingest(args) -> int:
     if args.parser == "codex":
         session_names = _load_session_names(ledger.config.codex_sessions_dir.parent)
 
+    attestations = ledger.attestations()
+    signing_key = None
+    if attestations:
+        try:
+            signing_key = load_key(ledger.config.get("attestation.key_file") or None)
+        except AttestationError as exc:
+            print("提示：{0}".format(exc), file=sys.stderr)
+
+    required = bool(args.require_attestation or ledger.config.get("attestation.require", False))
+    attestation_counts: dict = {}
+    rejected = 0
+
     planned = []
     for path in files:
+        attestation = verify_file(path, attestations, key=signing_key)
+        attestation_counts[attestation["status"]] = attestation_counts.get(attestation["status"], 0) + 1
+        if required and not is_satisfied(attestation["status"]):
+            rejected += 1
+            print(
+                "拒绝入账（来源未通过证明）：{0} —— {1}".format(path, attestation.get("reason")),
+                file=sys.stderr,
+            )
+            continue
         try:
             events = list(
                 parser.parse(
@@ -386,7 +431,12 @@ def cmd_ingest(args) -> int:
                 "partial": True if event.partial else None,
             },
             project=event.project,
-            source={"parser": parser_cls.name, "file": str(path), "sha256": digest},
+            source={
+                "parser": parser_cls.name,
+                "file": str(path),
+                "sha256": digest,
+                "attestation": attestation,
+            },
             cost=cost,
             budget={"status": budget["status"], "budget_ids": budget["budget_ids"]},
             cumulative=event.cumulative,
@@ -415,7 +465,20 @@ def cmd_ingest(args) -> int:
         )
     )
     print("其中未定价 {0} 条（金额不可得），超预算 {1} 条".format(unpriced, exceeded))
+    if attestation_counts:
+        print(
+            "来源证明：{0}".format(
+                "，".join(
+                    "{0} {1} 个文件".format(ATTESTATION_STATUS_TEXT.get(status, status), count)
+                    for status, count in sorted(attestation_counts.items())
+                )
+            )
+        )
+    if rejected:
+        print("被拒绝入账（来源未通过证明）：{0} 个文件".format(rejected))
     print("git：{0}".format(commit_note))
+    if rejected and required:
+        return EXIT_ATTESTATION_FAILED
     if exceeded and args.strict:
         return EXIT_BUDGET_EXCEEDED
     return EXIT_OK
@@ -430,6 +493,7 @@ def cmd_query(args) -> int:
         "session": args.session,
         "budget_status": args.budget_status,
         "cost_status": args.cost_status,
+        "attestation": args.attestation,
     }
     rows = ledger.index.query(
         kind=KIND_USAGE, start=args.since, end=args.until, limit=args.limit, filters=filters
@@ -437,6 +501,11 @@ def cmd_query(args) -> int:
     if args.format == "json":
         print(render_json(rows))
     else:
+        for row in rows:
+            if row.get("attestation_status"):
+                row["attestation_status"] = ATTESTATION_STATUS_TEXT.get(
+                    row["attestation_status"], row["attestation_status"]
+                )
         print(render(rows, COLUMNS_VOUCHERS, args.format))
     return EXIT_OK
 
@@ -446,6 +515,8 @@ def _exceptions_report(ledger: Ledger, args, base_filters: dict) -> int:
         ("超预算凭证", {"budget_status": "exceeded"}),
         ("无授权凭证", {"budget_status": "unbudgeted"}),
         ("未定价凭证", {"cost_status": "unpriced"}),
+        ("来源无证明的凭证", {"attestation": "unsigned"}),
+        ("来源在签名后被改动的凭证", {"attestation": "changed"}),
     )
     found = 0
     for title, extra in groups:
@@ -474,7 +545,12 @@ def _exceptions_report(ledger: Ledger, args, base_filters: dict) -> int:
 
 def cmd_report(args) -> int:
     ledger = _open_ledger(args)
-    filters = {"agent": args.agent, "model": args.model, "project": args.project}
+    filters = {
+        "agent": args.agent,
+        "model": args.model,
+        "project": args.project,
+        "attestation": args.attestation,
+    }
     if args.exceptions:
         return _exceptions_report(ledger, args, filters)
 
@@ -517,6 +593,13 @@ def cmd_report(args) -> int:
         print(
             "提示：{0} 张凭证未定价，金额合计不完整（tledger report --exceptions 查看明细）".format(
                 totals["unpriced_vouchers"]
+            )
+        )
+    if int(totals.get("unattested_vouchers") or 0):
+        print("")
+        print(
+            "提示：{0} 张凭证的来源未通过证明，入账前的可靠性无法确认（tledger report --exceptions 查看明细）".format(
+                totals["unattested_vouchers"]
             )
         )
     return EXIT_OK
@@ -645,6 +728,18 @@ def cmd_verify(args) -> int:
             index_info["jsonl_vouchers"], index_info["index_vouchers"]
         )
     )
+    if result.get("attestations"):
+        print(
+            "  来源证明覆盖：{0}".format(
+                "，".join(
+                    "{0} {1} 张".format(
+                        ATTESTATION_STATUS_TEXT.get(item["status"], item["status"]),
+                        item["vouchers"],
+                    )
+                    for item in result["attestations"]
+                )
+            )
+        )
     for entry in result["session_totals"]:
         if entry["status"] != "matched":
             print(
@@ -709,6 +804,130 @@ def cmd_history(args) -> int:
     return EXIT_OK
 
 
+ATTESTATION_COLUMNS = [
+    ("voucher_no", "证明凭证号"),
+    ("signed_at", "签名时间"),
+    ("path", "文件"),
+    ("sha256", "文件哈希(前16位)"),
+    ("key_id", "密钥标识"),
+    ("signer", "签名人"),
+    ("note", "备注"),
+]
+
+ATTESTATION_CHECK_COLUMNS = [
+    ("path", "文件"),
+    ("status", "结论"),
+    ("signed_at", "签名时间"),
+    ("key_id", "密钥标识"),
+    ("reason", "说明"),
+]
+
+
+def cmd_attest(args) -> int:
+    if args.action == "keygen":
+        try:
+            target, identifier = generate_key(getattr(args, "out", None), overwrite=getattr(args, "force", False))
+        except AttestationError as exc:
+            print("错误：{0}".format(exc), file=sys.stderr)
+            return EXIT_ERROR
+        print("密钥已生成：{0}".format(target))
+        print("密钥标识：{0}".format(identifier))
+        print("提示：密钥不要提交进账本仓库；密钥丢失后旧签名将无法验证。")
+        return EXIT_OK
+
+    ledger = _open_ledger(args)
+    key_path = getattr(args, "key", None) or ledger.config.get("attestation.key_file") or None
+
+    if args.action == "sign":
+        try:
+            key = load_key(key_path)
+        except AttestationError as exc:
+            print("错误：{0}".format(exc), file=sys.stderr)
+            return EXIT_ERROR
+        files = _expand_paths(args.paths, pattern=getattr(args, "glob", "*.jsonl"))
+        if not files:
+            print("没有找到要签名的文件", file=sys.stderr)
+            return EXIT_ERROR
+        existing = ledger.dedup_keys(KIND_ATTESTATION)
+        signed = skipped = 0
+        for item in files:
+            payload = sign_file(
+                item, key, signer=getattr(args, "signer", None), note=getattr(args, "note", None)
+            )
+            if payload["dedup_key"] in existing:
+                skipped += 1
+                continue
+            record = ledger.append(KIND_ATTESTATION, payload, dedup_key=payload["dedup_key"])
+            existing.add(payload["dedup_key"])
+            signed += 1
+            print("已登记证明：{0}  {1}".format(record["voucher_no"], item))
+        if signed and ledger.config.auto_commit:
+            gitrepo.commit_all(ledger.root, "feat(ledger): attest {0} source file(s)".format(signed))
+        print("完成：新增证明 {0} 条，跳过 {1} 条（文件哈希未变，此前已签过）".format(signed, skipped))
+        return EXIT_OK
+
+    if args.action == "list":
+        rows = []
+        for item in ledger.index.attestations():
+            payload = item["payload"]
+            subject = payload.get("subject") or {}
+            rows.append(
+                {
+                    "voucher_no": item["voucher_no"],
+                    "signed_at": payload.get("signed_at"),
+                    "path": subject.get("path"),
+                    "sha256": (subject.get("sha256") or "")[:16],
+                    "key_id": payload.get("key_id"),
+                    "signer": payload.get("signer") or "-",
+                    "note": payload.get("note") or "-",
+                }
+            )
+        print(render_table(rows, ATTESTATION_COLUMNS, empty="还没有任何来源证明"))
+        return EXIT_OK
+
+    # verify
+    attestations = ledger.attestations()
+    if args.paths:
+        targets = _expand_paths(args.paths, pattern=getattr(args, "glob", "*.jsonl"))
+    else:
+        targets = []
+        seen = set()
+        for payload in attestations:
+            path = (payload.get("subject") or {}).get("path")
+            if path and path not in seen:
+                seen.add(path)
+                targets.append(path)
+    if not targets:
+        print("没有要核对的目标：指定路径，或先执行 tledger attest sign")
+        return EXIT_OK
+
+    key = None
+    try:
+        key = load_key(key_path)
+    except AttestationError as exc:
+        print("提示：{0}".format(exc), file=sys.stderr)
+
+    rows = []
+    failed = 0
+    for target in targets:
+        result = verify_file(target, attestations, key=key)
+        if result["status"] != "verified":
+            failed += 1
+        rows.append(
+            {
+                "path": target,
+                "status": ATTESTATION_STATUS_TEXT.get(result["status"], result["status"]),
+                "signed_at": result.get("signed_at") or "-",
+                "key_id": result.get("key_id") or "-",
+                "reason": result.get("reason") or "-",
+            }
+        )
+    print(render_table(rows, ATTESTATION_CHECK_COLUMNS))
+    print("")
+    print("结论：{0}".format("全部通过" if not failed else "{0} 个文件未通过".format(failed)))
+    return EXIT_OK if not failed else EXIT_ATTESTATION_FAILED
+
+
 # --------------------------------------------------------------------------- #
 # 参数定义
 # --------------------------------------------------------------------------- #
@@ -745,7 +964,13 @@ def build_parser() -> argparse.ArgumentParser:
     p_record.add_argument("--input-tokens", type=int, default=0)
     p_record.add_argument("--output-tokens", type=int, default=0)
     p_record.add_argument("--cached-input-tokens", type=int, default=0)
-    p_record.add_argument("--cache-write-tokens", type=int, default=0)
+    p_record.add_argument(
+        "--cache-write-tokens",
+        "--cache-write-input-tokens",
+        dest="cache_write_input_tokens",
+        type=int,
+        default=0,
+    )
     p_record.add_argument("--reasoning-output-tokens", type=int, default=0)
     p_record.add_argument("--total-tokens", type=int, default=0)
     p_record.add_argument("--occurred-at", help="发生时间，默认现在（UTC）")
@@ -770,6 +995,11 @@ def build_parser() -> argparse.ArgumentParser:
     p_ingest.add_argument("--dry-run", action="store_true", help="只预览，不写账")
     p_ingest.add_argument("--no-commit", action="store_true", help="本次不自动 git 提交")
     p_ingest.add_argument("--strict", action="store_true", help="有超预算凭证时返回退出码 5")
+    p_ingest.add_argument(
+        "--require-attestation",
+        action="store_true",
+        help="来源未通过密码学证明的日志拒绝入账（退出码 6）",
+    )
     p_ingest.set_defaults(handler=cmd_ingest)
 
     p_query = sub.add_parser("query", parents=[common], help="凭证级明细查询")
@@ -779,6 +1009,7 @@ def build_parser() -> argparse.ArgumentParser:
     p_query.add_argument("--session")
     p_query.add_argument("--budget-status", choices=["within", "exceeded", "unbudgeted", "indeterminate", "no_limit"])
     p_query.add_argument("--cost-status", choices=["priced", "unpriced"])
+    p_query.add_argument("--attestation", choices=sorted(ATTESTATION_STATUS_TEXT))
     p_query.add_argument("--since")
     p_query.add_argument("--until")
     p_query.add_argument("--limit", type=int, default=50)
@@ -793,6 +1024,7 @@ def build_parser() -> argparse.ArgumentParser:
     p_report.add_argument("--since")
     p_report.add_argument("--until")
     p_report.add_argument("--limit", type=int)
+    p_report.add_argument("--attestation", choices=sorted(ATTESTATION_STATUS_TEXT))
     p_report.add_argument("--exceptions", action="store_true", help="只列例外凭证")
     p_report.add_argument("--format", choices=["table", "json", "csv"], default="table")
     p_report.set_defaults(handler=cmd_report)
@@ -819,6 +1051,33 @@ def build_parser() -> argparse.ArgumentParser:
     p_bstatus = budget_sub.add_parser("status", parents=[common], help="授权执行情况")
     p_bstatus.add_argument("--strict", action="store_true", help="超限时返回退出码 5")
     p_bstatus.set_defaults(handler=cmd_budget)
+
+    p_attest = sub.add_parser(
+        "attest", parents=[common], help="来源日志证明：keygen / sign / list / verify"
+    )
+    attest_sub = p_attest.add_subparsers(dest="action", required=True)
+
+    p_keygen = attest_sub.add_parser("keygen", parents=[common], help="生成签名密钥")
+    p_keygen.add_argument("--out", help="密钥文件路径，默认放在用户配置目录")
+    p_keygen.add_argument("--force", action="store_true", help="覆盖已有密钥（会作废旧签名）")
+    p_keygen.set_defaults(handler=cmd_attest)
+
+    p_asign = attest_sub.add_parser("sign", parents=[common], help="为日志文件签名并登记证明")
+    p_asign.add_argument("paths", nargs="+", help="日志文件或目录")
+    p_asign.add_argument("--key", help="密钥文件，默认用配置里的 attestation.key_file")
+    p_asign.add_argument("--glob", default="*.jsonl", help="目录内的文件名匹配")
+    p_asign.add_argument("--signer", help="签名人标识（职务分离留痕）")
+    p_asign.add_argument("--note")
+    p_asign.set_defaults(handler=cmd_attest)
+
+    p_alist = attest_sub.add_parser("list", parents=[common], help="列出已登记的证明")
+    p_alist.set_defaults(handler=cmd_attest)
+
+    p_averify = attest_sub.add_parser("verify", parents=[common], help="核对文件与已登记的证明")
+    p_averify.add_argument("paths", nargs="*", help="留空则核对所有已登记的文件")
+    p_averify.add_argument("--key")
+    p_averify.add_argument("--glob", default="*.jsonl")
+    p_averify.set_defaults(handler=cmd_attest)
 
     p_rec = sub.add_parser("reconcile", parents=[common], help="与供应商账单对账")
     p_rec.add_argument("--bill", required=True, help="账单 CSV")

@@ -130,6 +130,21 @@ def reopen(current, root) -> Ledger:
     return Ledger.open(root)
 
 
+def set_attestation_key(root, key_path) -> None:
+    """把密钥路径写进账本配置。
+
+    配置模板里已经有 [attestation] 段，所以这里替换占位行，
+    而不是再追加一段（重复的 TOML 段会直接解析失败）。
+    """
+    config = Path(root) / "tokenledger.toml"
+    text = config.read_text(encoding="utf-8")
+    token = 'key_file = ""'
+    if token not in text:
+        raise AssertionError("配置模板里找不到 {0}".format(token))
+    replacement = 'key_file = "{0}"'.format(str(key_path).replace("\\", "/"))
+    config.write_text(text.replace(token, replacement, 1), encoding="utf-8")
+
+
 def write_bill(path, rows) -> Path:
     path = Path(path)
     path.parent.mkdir(parents=True, exist_ok=True)

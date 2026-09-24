@@ -17,9 +17,11 @@ from pathlib import Path
 from typing import Any, Iterator
 
 from . import repo as gitrepo
+from .attestation import STATUS_CHANGED, STATUS_INVALID
 from .config import CONFIG_FILENAME, CONFIG_TEMPLATE, Config
 from .models import (
     GENESIS_HASH,
+    KIND_ATTESTATION,
     KIND_AUTHORIZATION,
     KIND_USAGE,
     PREFIX_KIND,
@@ -37,7 +39,11 @@ from .models import (
 )
 from .store import Index
 
-STREAM_FILES = {KIND_USAGE: "usage.jsonl", KIND_AUTHORIZATION: "authorization.jsonl"}
+STREAM_FILES = {
+    KIND_USAGE: "usage.jsonl",
+    KIND_AUTHORIZATION: "authorization.jsonl",
+    KIND_ATTESTATION: "attestation.jsonl",
+}
 LOCK_FILENAME = "ledger.lock"
 LOCK_STALE_SECONDS = 300
 LOCK_WAIT_SECONDS = 10.0
@@ -249,6 +255,10 @@ class Ledger:
                 keys.add(str(value))
         return keys
 
+    def attestations(self) -> list[dict]:
+        """全部来源证明（用于入账时核对）。"""
+        return [item["payload"] for item in self.index.attestations()]
+
     def has_dedup_key(self, kind: str, dedup_key: str | None) -> bool:
         if not dedup_key:
             return False
@@ -318,7 +328,7 @@ class Ledger:
         errors: list[str] = []
         kinds: dict[str, dict] = {}
 
-        for kind in (KIND_USAGE, KIND_AUTHORIZATION):
+        for kind in STREAM_FILES:
             prev_hash = GENESIS_HASH
             count = 0
             expected_seq: dict[tuple[str, int], int] = {}
@@ -353,7 +363,7 @@ class Ledger:
 
         # 索引 vs 明细账
         expected_hashes = {}
-        for kind in (KIND_USAGE, KIND_AUTHORIZATION):
+        for kind in STREAM_FILES:
             for record in self.read_records(kind):
                 expected_hashes[record.get("voucher_no")] = record.get("hash")
         actual_hashes = self.index.record_hashes()
@@ -419,12 +429,28 @@ class Ledger:
                 )
             session_totals.append(entry)
 
+        # 来源证明覆盖情况：changed / invalid 是实打实的篡改信号，必须让审计失败
+        attestation_rows = self.index.aggregate(group_by="attestation", kind=KIND_USAGE)
+        attestation_report = []
+        for row in attestation_rows:
+            status = row.get("grp")
+            attestation_report.append(
+                {"status": status, "vouchers": int(row.get("vouchers") or 0)}
+            )
+            if status in (STATUS_CHANGED, STATUS_INVALID):
+                errors.append(
+                    "有 {0} 张凭证的来源日志被改动过或证明不自洽（状态 {1}）".format(
+                        row.get("vouchers"), status
+                    )
+                )
+
         return {
             "ok": not errors,
             "errors": errors,
             "kinds": kinds,
             "index": index_report,
             "session_totals": session_totals,
+            "attestations": attestation_report,
         }
 
     def reindex(self) -> dict:
@@ -432,7 +458,7 @@ class Ledger:
         with repo_lock(self.lock_path):
             index = self.index
             index.clear_vouchers()
-            for kind in (KIND_USAGE, KIND_AUTHORIZATION):
+            for kind in STREAM_FILES:
                 last_seq_by_year: dict[int, int] = {}
                 for record in self.read_records(kind):
                     payload = record.get("payload") or {}

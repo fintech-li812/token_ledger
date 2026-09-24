@@ -1,0 +1,99 @@
+{
+  "note": "This file is both the input to tools/jev_judgment.py and the record of what was asked. Jev's raw answer is stored next to it as next-step.verdict.json.",
+  "state": {
+    "project": {
+      "name": "tokenledger",
+      "purpose": "An auditable token-usage ledger for AI agents, built on enterprise internal-control principles: vouchers, authorization, reconciliation, and a tamper-evident audit trail. Each token-consuming event becomes an append-only voucher; spending is compared against pre-issued authorization vouchers; the ledger can be reconciled against a provider bill.",
+      "maturity": "working prototype, version 0.1.0",
+      "implemented": [
+        "Append-only voucher ledger in JSONL, with a SHA-256 hash chain linking each voucher to its predecessor.",
+        "Gapless sequential voucher numbering (TL-YYYY-NNNNNN for usage, TA-YYYY-NNNNNN for authorization).",
+        "SQLite index used only as a derived cache; the JSONL ledger is the single source of truth and the index can be rebuilt at any time.",
+        "Authorization vouchers define a scope (agent, project, model), a period, and a limit in currency or tokens. Usage is compared against them at booking time. Over-limit vouchers are still booked, but flagged.",
+        "Pricing is deliberately empty by default: the tool refuses to guess vendor prices. Unpriced usage is marked 'unpriced' and can never be silently treated as zero cost.",
+        "Idempotent ingestion via deduplication keys, so re-reading the same log does not double-book.",
+        "Log parser for the Codex CLI rollout format, plus a generic JSONL parser with configurable field mapping.",
+        "Commands: init, record, ingest, query, report, budget, reconcile, verify, reindex, export, history.",
+        "Exit codes for automation: 3 audit failed, 4 reconciliation mismatch, 5 budget exceeded."
+      ],
+      "verified": [
+        "22 unit tests pass (standard library unittest only).",
+        "Ingested 296 vouchers from 9 real Codex CLI session logs covering 13.8 million tokens; the hash chain audit passed.",
+        "Session-level reconciliation passes: the sum of per-turn deltas equals the cumulative total reported in the source logs."
+      ],
+      "constraints": [
+        "Python 3.11 or newer, standard library only, zero runtime dependencies.",
+        "Must run unchanged on Windows, macOS and Linux; no hard-coded paths.",
+        "Local-first: no cloud service, no data leaves the machine.",
+        "Append-only by design: there is no update or delete command; corrections must be new reversing entries."
+      ],
+      "known_limitations": [
+        "The hash chain proves a booked voucher was not altered after booking, but it cannot prove the source agent log was not altered before ingestion.",
+        "Only the Codex CLI log format is parsed out of the box; other agents need a small new parser or manual field mapping.",
+        "All documentation is in Chinese, including the README and the internal-control mapping document.",
+        "Model prices must be filled in by hand before any currency-based limit can be evaluated.",
+        "No user authentication or multi-user access control; it assumes a single trusted operator."
+      ],
+      "user_context": "A single developer on Windows who uses the Codex CLI daily, wants internal-control-grade accounting for AI token spending, and intends to release the project as open source."
+    },
+    "candidate_next_steps": {
+      "agent_parsers": {
+        "title": "Add parsers for other AI coding agents",
+        "what": "Write log parsers for additional agents (for example Claude Code, Gemini CLI) so one ledger covers every agent the user runs, instead of only the Codex CLI.",
+        "effort": "Medium. Each parser is a small module plus tests; the ingestion, pricing, authorization and audit layers already work for any source.",
+        "risk": "The log formats are undocumented and change between versions, so parsers can break silently and under-report spending."
+      },
+      "english_readme": {
+        "title": "Translate and expand the documentation into English",
+        "what": "Provide an English README, an English internal-control mapping document, and a short architecture note, so an international audience can evaluate and adopt the tool.",
+        "effort": "Low to medium. Writing only; no new code paths.",
+        "risk": "Documentation can drift from the code if it is not exercised by tests."
+      },
+      "log_signing": {
+        "title": "Add cryptographic attestation of source agent logs",
+        "what": "Make pre-ingestion tampering detectable, for example by having the agent or a wrapper sign each log segment with an HMAC or key pair, and having the ledger store and verify that signature at ingestion time.",
+        "effort": "High. Requires a signing wrapper around the agent, key management, a verification step in the parser, and a policy for unsigned historical logs.",
+        "risk": "Adds operational complexity for every user, and most existing logs would remain unsigned."
+      }
+    }
+  },
+  "questions": {
+    "next_step": {
+      "type": "choice",
+      "instructions": "Read `project` (purpose, maturity, what is implemented, what is verified, constraints, known limitations, user context) and the three candidate next steps in `candidate_next_steps`. Judged only by how much the candidate improves this tool's fitness for its stated purpose, which single next step should be built next?",
+      "criteria": {
+        "agent_parsers": "Add parsers for other AI coding agents so one ledger covers every agent the user runs, not only the Codex CLI.",
+        "english_readme": "Translate and expand the documentation into English so an international audience can evaluate and adopt the tool.",
+        "log_signing": "Add cryptographic attestation of source agent logs so pre-ingestion tampering becomes detectable, not only post-booking tampering.",
+        "none_of_these": "None of the three is the right next step; something else in `project` matters more right now."
+      }
+    },
+    "readiness": {
+      "type": "score",
+      "instructions": "Based on `project`, how ready is this tool to be used for real, financial-grade control over AI token spending by a small team, as opposed to being a personal prototype? The lowest level is 0 and the highest is 4.",
+      "criteria": [
+        "Prototype: works on one machine and one agent, offers no protection against pre-ingestion tampering, documentation in a single language.",
+        "Useful to its author for personal cost tracking, but clear gaps block team use.",
+        "Usable by a small team that standardises on the same agent tooling, with accepted manual setup and manual price entry.",
+        "Usable by a team with mixed agent tooling and provides evidence strong enough for an internal review.",
+        "Suitable for external audit or regulated use without further assurance work."
+      ]
+    },
+    "chinese_only_docs_acceptable": {
+      "type": "noul",
+      "instructions": "For a project whose stated goal is to be usable by others as open source, is Chinese-only documentation an acceptable state to leave in place for now?",
+      "criteria": {
+        "true": "Chinese-only documentation is acceptable for the current stage; it does not block the stated goal yet.",
+        "false": "Chinese-only documentation materially blocks adoption by the intended audience and should be addressed."
+      }
+    },
+    "log_signing_required": {
+      "type": "noul",
+      "instructions": "For this tool to be credible as internal control over spending rather than a convenience report, is cryptographic attestation of source logs (evidence that a log was not altered before ingestion) a requirement rather than a nice-to-have?",
+      "criteria": {
+        "true": "A requirement: without it, the evidence chain has a gap that an auditor or a sceptical reviewer would reject.",
+        "false": "A nice-to-have: the post-booking hash chain and reconciliation already provide enough assurance for this use case."
+      }
+    }
+  }
+}

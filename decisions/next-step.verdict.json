@@ -1,0 +1,47 @@
+{
+  "model": "jev-1.13.0",
+  "answers": {
+    "next_step": {
+      "type": "choice",
+      "choice": "log_signing",
+      "confidence": 0.7,
+      "probabilities": {
+        "agent_parsers": 0.16,
+        "log_signing": 0.78,
+        "english_readme": 0.06,
+        "none_of_these": 0.0
+      }
+    },
+    "readiness": {
+      "type": "score",
+      "score": 0.46,
+      "confidence": 0.62,
+      "legend": {
+        "0": "Prototype: works on one machine and one agent, offers no protection against pre-ingestion tampering, documentation in a single language.",
+        "1": "Useful to its author for personal cost tracking, but clear gaps block team use.",
+        "2": "Usable by a small team that standardises on the same agent tooling, with accepted manual setup and manual price entry.",
+        "3": "Usable by a team with mixed agent tooling and provides evidence strong enough for an internal review.",
+        "4": "Suitable for external audit or regulated use without further assurance work."
+      },
+      "probabilities": {
+        "0": 0.6,
+        "1": 0.35,
+        "2": 0.05,
+        "3": 0.0,
+        "4": 0.0
+      }
+    },
+    "chinese_only_docs_acceptable": {
+      "type": "noul",
+      "noul": 0.29
+    },
+    "log_signing_required": {
+      "type": "noul",
+      "noul": 0.7
+    }
+  },
+  "usage": {
+    "input_tokens": 1992,
+    "output_tokens": 114
+  }
+}

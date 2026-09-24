@@ -23,6 +23,7 @@ DEFAULTS: dict[str, Any] = {
     "ledger": {"dir": "ledger", "auto_commit": True},
     "report": {"default_group_by": "agent", "top": 20},
     "pricing": {"currency": "USD", "cached_input_included_in_input": True, "models": {}},
+    "attestation": {"key_file": "", "require": False},
     "ingest": {"codex": {"home": "", "default_model": ""}, "generic": {}},
 }
 
@@ -49,6 +50,12 @@ cached_input_included_in_input = true
 # output = 0.0
 # cached_input = 0.0
 # cache_write = 0.0
+
+[attestation]
+# 密钥文件；留空则用用户配置目录下的 attestation.key（不要提交进仓库）
+key_file = ""
+# true 时，来源没有通过密码学证明的日志会被拒绝入账（退出码 6）
+require = false
 
 [ingest.codex]
 # 留空则自动探测：$CODEX_HOME/sessions，其次 ~/.codex/sessions

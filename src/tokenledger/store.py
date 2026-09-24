@@ -11,7 +11,13 @@ import sqlite3
 from pathlib import Path
 from typing import Any
 
-from .models import KIND_AUTHORIZATION, KIND_USAGE, canonical_json, parse_voucher_no
+from .models import (
+    KIND_ATTESTATION,
+    KIND_AUTHORIZATION,
+    KIND_USAGE,
+    canonical_json,
+    parse_voucher_no,
+)
 
 SCHEMA_VERSION = 1
 
@@ -46,6 +52,7 @@ CREATE TABLE IF NOT EXISTS vouchers (
     cost_status              TEXT,
     budget_status            TEXT,
     budget_ids               TEXT,
+    attestation_status       TEXT,
     source_parser            TEXT,
     source_file              TEXT,
     dedup_key                TEXT,
@@ -62,15 +69,21 @@ CREATE INDEX IF NOT EXISTS idx_vouchers_model ON vouchers (model);
 CREATE INDEX IF NOT EXISTS idx_vouchers_project ON vouchers (project);
 CREATE INDEX IF NOT EXISTS idx_vouchers_session ON vouchers (session_id);
 CREATE INDEX IF NOT EXISTS idx_vouchers_budget ON vouchers (budget_status);
+CREATE INDEX IF NOT EXISTS idx_vouchers_attestation ON vouchers (attestation_status);
 """
+
+# 老账本的索引里没有后来新增的列：启动时自动补齐，保证升级不需要重建账本
+REQUIRED_COLUMNS = {
+    "attestation_status": "TEXT",
+}
 
 INSERT_COLUMNS = (
     "voucher_no", "kind", "seq", "year", "recorded_at", "occurred_at", "occurred_day",
     "agent_id", "agent_provider", "model", "session_id", "turn_id", "project",
     "input_tokens", "cached_input_tokens", "cache_write_input_tokens", "output_tokens",
     "reasoning_output_tokens", "total_tokens", "cost_amount", "cost_currency", "cost_status",
-    "budget_status", "budget_ids", "source_parser", "source_file", "dedup_key",
-    "record_hash", "payload",
+    "budget_status", "budget_ids", "attestation_status", "source_parser", "source_file",
+    "dedup_key", "record_hash", "payload",
 )
 
 GROUP_EXPRESSIONS = {
@@ -83,6 +96,7 @@ GROUP_EXPRESSIONS = {
     "parser": "source_parser",
     "budget_status": "budget_status",
     "cost_status": "cost_status",
+    "attestation": "attestation_status",
     "voucher": "voucher_no",
 }
 
@@ -95,10 +109,13 @@ FILTER_COLUMNS = {
     "parser": "source_parser",
     "budget_status": "budget_status",
     "cost_status": "cost_status",
+    "attestation": "attestation_status",
     "dedup_key": "dedup_key",
     "voucher_no": "voucher_no",
     "turn_id": "turn_id",
 }
+
+ALL_KINDS = (KIND_USAGE, KIND_AUTHORIZATION, KIND_ATTESTATION)
 
 AGGREGATE_SELECT = """
     COUNT(*)                                                          AS vouchers,
@@ -115,8 +132,18 @@ AGGREGATE_SELECT = """
     COALESCE(SUM(CASE WHEN budget_status = 'exceeded' THEN 1 ELSE 0 END), 0)
                                                                      AS exceeded_vouchers,
     COALESCE(SUM(CASE WHEN budget_status = 'unbudgeted' THEN 1 ELSE 0 END), 0)
-                                                                     AS unbudgeted_vouchers
+                                                                     AS unbudgeted_vouchers,
+    COALESCE(SUM(CASE WHEN attestation_status IS NOT NULL AND attestation_status <> 'verified'
+                      THEN 1 ELSE 0 END), 0)                         AS unattested_vouchers
 """
+
+VOUCHER_COLUMNS = (
+    "voucher_no, kind, recorded_at, occurred_at, occurred_day, agent_id, agent_provider, "
+    "model, session_id, turn_id, project, input_tokens, cached_input_tokens, "
+    "cache_write_input_tokens, output_tokens, reasoning_output_tokens, total_tokens, "
+    "cost_amount, cost_currency, cost_status, budget_status, budget_ids, attestation_status, "
+    "source_parser, source_file, dedup_key"
+)
 
 
 def _as_int(value: Any) -> int:
@@ -124,6 +151,13 @@ def _as_int(value: Any) -> int:
         return int(value or 0)
     except (TypeError, ValueError):
         return 0
+
+
+def _attestation_of(payload: dict) -> str | None:
+    source = payload.get("source") or {}
+    attestation = source.get("attestation") or {}
+    status = attestation.get("status")
+    return str(status) if status else None
 
 
 def _usage_columns(payload: dict) -> dict:
@@ -153,6 +187,7 @@ def _usage_columns(payload: dict) -> dict:
         "cost_status": cost.get("status"),
         "budget_status": budget.get("status"),
         "budget_ids": ",".join(budget.get("budget_ids") or []) or None,
+        "attestation_status": _attestation_of(payload),
         "source_parser": source.get("parser"),
         "source_file": source.get("file"),
     }
@@ -182,9 +217,44 @@ def _authorization_columns(payload: dict) -> dict:
         "cost_status": "limit",
         "budget_status": None,
         "budget_ids": None,
+        "attestation_status": None,
         "source_parser": "authorization",
         "source_file": None,
     }
+
+
+def _attestation_columns(payload: dict) -> dict:
+    subject = payload.get("subject") or {}
+    return {
+        "occurred_at": payload.get("signed_at"),
+        "occurred_day": payload.get("occurred_day") or (payload.get("signed_at") or "")[:10],
+        "agent_id": payload.get("signer"),
+        "agent_provider": None,
+        "model": None,
+        "session_id": None,
+        "turn_id": None,
+        "project": None,
+        "input_tokens": 0,
+        "cached_input_tokens": 0,
+        "cache_write_input_tokens": 0,
+        "output_tokens": 0,
+        "reasoning_output_tokens": 0,
+        "total_tokens": 0,
+        "cost_amount": None,
+        "cost_currency": None,
+        "cost_status": None,
+        "budget_status": None,
+        "budget_ids": None,
+        "attestation_status": None,
+        "source_parser": "attestation",
+        "source_file": subject.get("path"),
+    }
+
+
+COLUMN_BUILDERS = {
+    KIND_AUTHORIZATION: _authorization_columns,
+    KIND_ATTESTATION: _attestation_columns,
+}
 
 
 def build_where(
@@ -229,8 +299,20 @@ class Index:
 
     def _ensure_schema(self) -> None:
         self._conn.executescript(SCHEMA_SQL)
+        self._migrate()
         self.set_meta("schema_version", str(SCHEMA_VERSION))
         self._conn.commit()
+
+    def _migrate(self) -> None:
+        """给老账本补上后来新增的列，升级不需要重建账本。"""
+        existing = {
+            row["name"] for row in self._conn.execute("PRAGMA table_info(vouchers)").fetchall()
+        }
+        for column, column_type in REQUIRED_COLUMNS.items():
+            if column not in existing:
+                self._conn.execute(
+                    "ALTER TABLE vouchers ADD COLUMN {0} {1}".format(column, column_type)
+                )
 
     # -- 生命周期 --------------------------------------------------------- #
     def close(self) -> None:
@@ -258,7 +340,7 @@ class Index:
         )
         self._conn.commit()
 
-    # -- 凭证编号序列 ----------------------------------------------------- #
+    # -- 凭证编号：只记录「最后一个已用编号」，编号本身由明细账推导 ---------- #
     def last_seq(self, kind: str, year: int) -> int:
         """索引里记录的「最后一个已用编号」。
 
@@ -286,10 +368,8 @@ class Index:
             "record_hash": record.get("hash") or "",
             "payload": canonical_json(payload),
         }
-        if kind == KIND_AUTHORIZATION:
-            row.update(_authorization_columns(payload))
-        else:
-            row.update(_usage_columns(payload))
+        builder = COLUMN_BUILDERS.get(kind, _usage_columns)
+        row.update(builder(payload))
         for column in INSERT_COLUMNS:
             row.setdefault(column, None)
         placeholders = ", ".join(":" + column for column in INSERT_COLUMNS)
@@ -305,21 +385,12 @@ class Index:
         self._conn.execute("DELETE FROM meta WHERE key LIKE 'seq:%'")
         self._conn.commit()
 
-    def has_dedup_key(self, kind: str, dedup_key: str) -> bool:
-        if not dedup_key:
-            return False
-        row = self._conn.execute(
-            "SELECT 1 FROM vouchers WHERE kind = ? AND dedup_key = ? LIMIT 1",
-            (kind, dedup_key),
-        ).fetchone()
-        return row is not None
-
     # -- 读取 ------------------------------------------------------------- #
     def counts(self) -> dict:
         rows = self._conn.execute(
             "SELECT kind, COUNT(*) AS n FROM vouchers GROUP BY kind"
         ).fetchall()
-        result = {KIND_USAGE: 0, KIND_AUTHORIZATION: 0}
+        result = {kind: 0 for kind in ALL_KINDS}
         for row in rows:
             result[row["kind"]] = row["n"]
         result["total"] = sum(result.values())
@@ -328,6 +399,23 @@ class Index:
     def record_hashes(self) -> dict:
         rows = self._conn.execute("SELECT voucher_no, record_hash FROM vouchers").fetchall()
         return {row["voucher_no"]: row["record_hash"] for row in rows}
+
+    def records(self, kind: str) -> list[dict]:
+        """取某一类凭证的全部 payload（附带凭证号），按凭证号排序。"""
+        rows = self._conn.execute(
+            "SELECT voucher_no, payload FROM vouchers WHERE kind = ? ORDER BY voucher_no",
+            (kind,),
+        ).fetchall()
+        return [
+            {"voucher_no": row["voucher_no"], "payload": json.loads(row["payload"])}
+            for row in rows
+        ]
+
+    def authorizations(self) -> list[dict]:
+        return self.records(KIND_AUTHORIZATION)
+
+    def attestations(self) -> list[dict]:
+        return self.records(KIND_ATTESTATION)
 
     def query(
         self,
@@ -340,13 +428,7 @@ class Index:
         filters: dict | None = None,
         columns: tuple[str, ...] | None = None,
     ) -> list[dict]:
-        selected = ", ".join(columns) if columns else (
-            "voucher_no, kind, recorded_at, occurred_at, occurred_day, agent_id, agent_provider, "
-            "model, session_id, turn_id, project, input_tokens, cached_input_tokens, "
-            "cache_write_input_tokens, output_tokens, reasoning_output_tokens, total_tokens, "
-            "cost_amount, cost_currency, cost_status, budget_status, budget_ids, "
-            "source_parser, source_file, dedup_key"
-        )
+        selected = ", ".join(columns) if columns else VOUCHER_COLUMNS
         where, params = build_where(kind=kind, start=start, end=end, filters=filters)
         sql = "SELECT {0} FROM vouchers{1} ORDER BY {2}".format(selected, where, order)
         if limit:
@@ -384,13 +466,3 @@ class Index:
         sql = "SELECT {0} FROM vouchers{1}".format(AGGREGATE_SELECT, where)
         row = self._conn.execute(sql, params).fetchone()
         return dict(row) if row else {}
-
-    def authorizations(self) -> list[dict]:
-        rows = self._conn.execute(
-            "SELECT voucher_no, payload FROM vouchers WHERE kind = ? ORDER BY voucher_no",
-            (KIND_AUTHORIZATION,),
-        ).fetchall()
-        result = []
-        for row in rows:
-            result.append({"voucher_no": row["voucher_no"], "payload": json.loads(row["payload"])})
-        return result

@@ -32,6 +32,7 @@ COLUMNS_VOUCHERS: list[tuple[str, str]] = [
     ("total_tokens", "合计"),
     ("cost_amount", "金额"),
     ("budget_status", "授权状态"),
+    ("attestation_status", "来源证明"),
 ]
 
 
