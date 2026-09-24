@@ -1,0 +1,16 @@
+__pycache__/
+*.py[cod]
+*.egg-info/
+build/
+dist/
+.venv/
+venv/
+.pytest_cache/
+.ruff_cache/
+
+# ledger runtime artifacts (derived index / locks are never source of truth)
+ledger/index.sqlite
+ledger/index.sqlite-journal
+ledger/index.sqlite-wal
+ledger/index.sqlite-shm
+ledger/*.lock
