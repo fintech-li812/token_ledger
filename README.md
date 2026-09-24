@@ -28,6 +28,9 @@ Requires Python 3.11+ (uses the standard-library `tomllib`). **Zero runtime depe
 
 ## Quickstart
 
+> A step-by-step walkthrough, with every command individually verified and a list of
+> known pitfalls, lives in [QUICKSTART.md](QUICKSTART.md).
+
 ```bash
 tledger init ~/ai-ledger          # creates the ledger, a git repo, and an initial commit
 cd ~/ai-ledger
@@ -182,6 +185,8 @@ A usage voucher:
 
 - `docs/internal-control.md` — internal-control mapping, control objectives, and walkthrough tests (Chinese).
 - `README.zh-CN.md` — Chinese README.
+- `QUICKSTART.md` — step-by-step walkthrough (English).
+- `QUICKSTART.zh-CN.md` — step-by-step walkthrough (Chinese).
 
 ## License
 

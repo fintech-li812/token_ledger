@@ -26,6 +26,8 @@ tledger --version
 
 ## 30 秒上手
 
+> 逐条命令都实测过的完整上手流程，附已知的坑：[QUICKSTART.zh-CN.md](QUICKSTART.zh-CN.md)。
+
 ```bash
 tledger init ~/ai-ledger          # 建账本目录（含本地 git 仓库 + 初始提交）
 cd ~/ai-ledger
