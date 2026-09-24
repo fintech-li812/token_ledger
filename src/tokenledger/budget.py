@@ -1,11 +1,13 @@
 """授权与预算控制。
 
-内控立场：**超限的凭证照样入账，但必须被标出来**。
+内控立场一：**超限的凭证照样入账，但必须被标出来**。
 内控的目标是让异常可见，而不是把异常藏起来或直接丢弃。
 
-另一个关键立场：**缺价格不等于没花钱**。
-如果某个模型没有定价，其金额无法参与超限判断，此时会返回 ``indeterminate``，
-而不是默默按 0 元处理。
+内控立场二：**缺价格不等于没花钱**。
+模型没定价时金额不可得，此时既不能判定为"未超限"，也不能算成 0 元，
+只能返回 ``indeterminate``（无法判定）并明确报出来。
+
+判定口径：**达到或超过额度即标记为超限**（额度用完就不该再花）。
 """
 
 from __future__ import annotations
@@ -13,14 +15,14 @@ from __future__ import annotations
 import fnmatch
 from typing import TYPE_CHECKING, Any
 
-from .models import KIND_AUTHORIZATION, KIND_USAGE, date_str
+from .models import KIND_AUTHORIZATION, KIND_USAGE
 
 if TYPE_CHECKING:
     from .ledger import Ledger
 
 
 def scope_matches(value: str | None, pattern: str | None) -> bool:
-    """授权范围支持通配符（"codex*"）。空值或 "*" 表示不限。"""
+    """授权范围支持通配符（如 codex*）。空值或 * 表示不限。"""
     if pattern in (None, "", "*"):
         return True
     if value is None:
@@ -86,20 +88,31 @@ def applicable_authorizations(
     return result
 
 
-def _used_for_authorization(ledger: "Ledger", authorization: dict) -> dict:
-    """授权覆盖范围内的历史用量（不含当前这笔）。
+def usage_filters_for_scope(scope: dict) -> dict:
+    """把授权范围翻译成查询条件。
 
-    授权里写死具体值时按该值过滤；写通配符时不做过滤（近似处理，见 docs）。
+    写死具体值时按值过滤；写通配符时不做过滤（近似处理，见 docs/internal-control.md）。
     """
+    filters: dict[str, Any] = {}
+    for key in ("agent", "project", "model"):
+        value = scope.get(key)
+        if value in (None, "", "*"):
+            continue
+        if any(char in str(value) for char in "*?["):
+            continue
+        filters[key] = value
+    return filters
+
+
+def _used_for_authorization(ledger: "Ledger", authorization: dict) -> dict:
+    """授权覆盖范围内的历史用量（不含当前这笔）。"""
     scope = authorization.get("scope") or {}
     period = authorization.get("period") or {}
-    filters: dict[str, Any] = {}
-    for key, column in (("agent", "agent"), ("project", "project"), ("model", "model")):
-        value = scope.get(key)
-        if value not in (None, "", "*") and not any(ch in str(value) for ch in "*?["):
-            filters[column] = value
     return ledger.index.totals(
-        kind=KIND_USAGE, start=period.get("from"), end=period.get("to"), filters=filters
+        kind=KIND_USAGE,
+        start=period.get("from"),
+        end=period.get("to"),
+        filters=usage_filters_for_scope(scope),
     )
 
 
@@ -152,7 +165,7 @@ def evaluate(
     cost_amount: float | None,
     total_tokens: int,
 ) -> dict:
-    """为一笔即将入账的用量判定授权状态。"""
+    """为一笔即将入账的用量判定授权状态（结果会写进这张凭证）。"""
     authorizations = applicable_authorizations(
         ledger, agent=agent, project=project, model=model, day=day
     )
@@ -176,14 +189,16 @@ def evaluate(
         }
         state["after"] = after
 
-        over = state["status"] == "exceeded"
-        if limit_amount is not None and after["amount"] > float(limit_amount):
+        if limit_amount is not None and after["amount"] >= float(limit_amount):
             state["status"] = "exceeded"
-            over = True
-        if limit_tokens is not None and after["tokens"] > int(limit_tokens):
+        if limit_tokens is not None and after["tokens"] >= int(limit_tokens):
             state["status"] = "exceeded"
-            over = True
-        if over:
+
+        # 金额不可得时不允许判定为未超限：缺价格 != 没花钱
+        if state["status"] == "within" and limit_amount is not None and cost_amount is None:
+            state["status"] = "indeterminate"
+
+        if state["status"] == "exceeded":
             state["exceeded_by"] = {
                 "amount": round(after["amount"] - float(limit_amount), 6)
                 if limit_amount is not None
@@ -210,9 +225,10 @@ def evaluate(
 
 
 def status_report(ledger: "Ledger") -> list[dict]:
-    """当前全部授权凭证的执行情况（实时重算，不看快照）。"""
-    return [
-        _authorization_state(ledger, dict(payload, voucher_no=item["voucher_no"]))
-        for item in ledger.index.authorizations()
-        for payload in [item["payload"]]
-    ]
+    """当前全部授权凭证的执行情况（每次实时重算，不看历史快照）。"""
+    report = []
+    for item in ledger.index.authorizations():
+        payload = dict(item["payload"])
+        payload["voucher_no"] = item["voucher_no"]
+        report.append(_authorization_state(ledger, payload))
+    return report
