@@ -21,6 +21,10 @@ classifiers = [
 ]
 dependencies = []
 
+[project.urls]
+Repository = "https://github.com/fintech-li812/token_ledger"
+Issues = "https://github.com/fintech-li812/token_ledger/issues"
+
 [project.optional-dependencies]
 dev = ["pytest>=7", "ruff>=0.5"]
 

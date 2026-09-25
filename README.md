@@ -1,5 +1,7 @@
 # tokenledger
 
+![ci](https://github.com/fintech-li812/token_ledger/actions/workflows/ci.yml/badge.svg)
+
 An auditable token-usage ledger for AI agents, built on enterprise internal-control principles:
 **vouchers, authorization, reconciliation, and a tamper-evident audit trail**.
 
@@ -19,7 +21,7 @@ An auditable token-usage ledger for AI agents, built on enterprise internal-cont
 ## Install
 
 ```bash
-git clone <this-repo> && cd token_ledger
+git clone https://github.com/fintech-li812/token_ledger.git && cd token_ledger
 python -m pip install -e .
 tledger --version
 ```

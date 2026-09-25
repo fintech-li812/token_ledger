@@ -1,5 +1,7 @@
 # tokenledger
 
+![ci](https://github.com/fintech-li812/token_ledger/actions/workflows/ci.yml/badge.svg)
+
 审计级 AI token 用量账本 —— 把企业内控的四根柱子（**凭证、授权、对账、审计留痕**）搬到 AI 成本治理上。
 
 > 每一笔 token 消耗，都要能回答：花了多少、谁花的、谁批的、有没有超标、有没有被改过。
@@ -17,7 +19,7 @@
 ## 安装
 
 ```bash
-git clone <this-repo> && cd token_ledger
+git clone https://github.com/fintech-li812/token_ledger.git && cd token_ledger
 python -m pip install -e .
 tledger --version
 ```
