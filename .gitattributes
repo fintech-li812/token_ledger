@@ -1,0 +1,4 @@
+# 统一换行符，避免 git 每次提示 LF/CRLF 警告
+* text=auto eol=lf
+*.bat text eol=crlf
+*.png binary
